@@ -1080,17 +1080,42 @@ async def build_main_agent(
     req: ProviderRequest | None = None,
     apply_reset: bool = True,
 ) -> MainAgentBuildResult | None:
-    """构建主对话代理（Main Agent），并且自动 reset。
+    """构建主对话代理（Main Agent），并可选地执行 reset 初始化。
 
-    If apply_reset is False, will not call reset on the agent runner.
+    这是核心编排函数，负责组装发送给 LLM 的完整请求（system prompt、用户消息、
+    对话历史、工具集），并初始化 AgentRunner 以供执行。
+
+    整体处理流水线：
+
+    阶段 1  – 选择 Provider（LLM 后端）
+    阶段 2  – 构建 ProviderRequest（提取 prompt、图片、文件、引用消息、对话历史）
+    阶段 3  – 上下文规范化 & 文件内容提取
+    阶段 4  – 请求装饰（prompt 前缀、人格、技能、子代理、图片描述、引用消息处理、系统提醒）
+    阶段 5  – 知识库注入
+    阶段 6  – Provider 兼容性修复（模态适配、插件工具过滤、历史上下文清洗）
+    阶段 7  – 安全模式注入
+    阶段 8  – 计算机使用工具（沙箱 / 本地）
+    阶段 9  – 附加能力工具（定时任务、主动消息）
+    阶段 10 – Token 上限自动检测
+    阶段 11 – System Prompt 最终化（工具调用指令、直播模式）
+    阶段 12 – AgentRunner reset（组装最终发给 LLM 的 messages[] 数组）
+
+    若 apply_reset 为 False，则 reset 协程会延迟执行并通过返回值传出。
     """
+
+    # ── 阶段 1：选择 Provider ─────────────────────────────────────────────
+    # 选择一个对话模型提供商（LLM 后端）。若未配置任何 Provider，则提前退出。
     provider = provider or _select_provider(event, plugin_context)
     if provider is None:
         logger.info("未找到任何对话模型（提供商），跳过 LLM 请求处理。")
         return None
 
+    # ── 阶段 2：构建 ProviderRequest ──────────────────────────────────────
+    # 构建或复用 ProviderRequest，它承载用户 prompt、图片 URL、附加内容块和
+    # 对话历史，贯穿整个流水线。
     if req is None:
         if event.get_extra("provider_request"):
+            # 复用已有的请求（例如插件已经提前构建好的 ProviderRequest）。
             req = event.get_extra("provider_request")
             assert isinstance(req, ProviderRequest), (
                 "provider_request 必须是 ProviderRequest 类型。"
@@ -1098,11 +1123,15 @@ async def build_main_agent(
             if req.conversation:
                 req.contexts = json.loads(req.conversation.history)
         else:
+            # ── 全新请求：从消息事件中提取 prompt、媒体附件和引用附件 ──
             req = ProviderRequest()
             req.prompt = ""
             req.image_urls = []
             if sel_model := event.get_extra("selected_model"):
                 req.model = sel_model
+
+            # 唤醒前缀守卫：若配置了前缀，仅当消息以该前缀开头时才继续处理，
+            # 同时从 prompt 中去除该前缀。
             if config.provider_wake_prefix and not event.message_str.startswith(
                 config.provider_wake_prefix
             ):
@@ -1110,7 +1139,9 @@ async def build_main_agent(
 
             req.prompt = event.message_str[len(config.provider_wake_prefix) :]
 
-            # media files attachments
+            # ── 2a：当前消息中的直接媒体附件（图片 & 文件）──
+            # 每张图片会被压缩，并同时记录到 image_urls（供视觉模型使用）和
+            # extra_user_content_parts（作为文本标记，供非视觉模型感知附件存在）。
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
                     path = await comp.convert_to_file_path()
@@ -1132,7 +1163,13 @@ async def build_main_agent(
                             text=f"[File Attachment: name {file_name}, path {file_path}]"
                         )
                     )
-            # quoted message attachments
+
+            # ── 2b：引用（回复）消息附件 ──────────────────────────────────
+            # 处理回复链中嵌入的图片/文件。有两条提取路径：
+            #   1) 嵌入链路径：直接遍历 comp.chain 中的 Image/File。
+            #   2) 兜底路径：当链中没有实际图片（只有占位符如 "[Image]"）时，
+            #      通过 extract_quoted_message_images() 调用平台 API 获取，
+            #      受 max_quoted_fallback_images 数量限制。
             reply_comps = [
                 comp for comp in event.message_obj.message if isinstance(comp, Reply)
             ]
@@ -1214,41 +1251,84 @@ async def build_main_agent(
                             exc_info=True,
                         )
 
+            # ── 2c：加载对话历史 ────────────────────────────────────────────
+            # 获取（或创建）持久化的会话对象，并将其历史记录反序列化到
+            # req.contexts 中，供后续作为 LLM 上下文窗口使用。
             conversation = await _get_session_conv(event, plugin_context)
             req.conversation = conversation
             req.contexts = json.loads(conversation.history)
             event.set_extra("provider_request", req)
 
+    # ── 阶段 3：上下文规范化 & 文件内容提取 ─────────────────────────────
+    # 确保 contexts 是列表（可能仍是 JSON 字符串），并对 image_urls 去重。
     if isinstance(req.contexts, str):
         req.contexts = json.loads(req.contexts)
     req.image_urls = normalize_and_dedupe_strings(req.image_urls)
 
+    # 可选：从附件文件（PDF、DOCX 等）中提取文本内容注入 prompt，
+    # 使 LLM 能够对文件内容进行推理。
     if config.file_extract_enabled:
         try:
             await _apply_file_extract(event, req, config)
         except Exception as exc:  # noqa: BLE001
             logger.error("Error occurred while applying file extract: %s", exc)
 
+    # 守卫：若既没有文本 prompt 也没有图片，则中止处理——
+    # 除非是私聊且存在附加内容块（如文件附件），此时用 "<attachment>" 占位。
     if not req.prompt and not req.image_urls:
         if not event.get_group_id() and req.extra_user_content_parts:
             req.prompt = "<attachment>"
         else:
             return None
 
+    # ── 阶段 4：请求装饰 ────────────────────────────────────────────────
+    # _decorate_llm_request() 执行多个子步骤来丰富 req：
+    #   4a. _apply_prompt_prefix()       → 前置/模板替换 prompt 前缀
+    #   4b. _ensure_persona_and_skills() → 将人格指令注入 system_prompt，
+    #        将开场白（begin_dialogs）插入 contexts 头部，注入技能提示词，
+    #        注册人格允许的工具集 & 子代理 Handoff 工具，追加路由提示词
+    #   4c. _ensure_img_caption()        → 通过副 LLM 生成图片描述
+    #   4d. _process_quote_message()     → 解析引用消息的文本/图片描述，
+    #        写入 extra_user_content_parts
+    #   4e. _append_system_reminders()   → 追加 <system_reminder>（用户身份、
+    #        群名、当前时间）到 extra_user_content_parts
+    #
+    # 调用完成后，req.system_prompt 包含：
+    #   人格指令 + 技能提示词 + 子代理路由提示词
     await _decorate_llm_request(event, req, plugin_context, config)
 
+    # ── 阶段 5：知识库注入 ──────────────────────────────────────────────
+    # 非 Agentic 模式：检索相关知识库片段，追加到 req.system_prompt 中，
+    # 格式为 "[Related Knowledge Base Results]"。
+    # Agentic 模式：注册一个知识库查询工具，让 LLM 按需检索。
     await _apply_kb(event, req, plugin_context, config)
 
     if not req.session_id:
         req.session_id = event.unified_msg_origin
 
+    # ── 阶段 6：Provider 兼容性修复 ──────────────────────────────────────
+    # 6a. _modalities_fix：若 Provider 不支持图片，将 image_urls 替换为
+    #     "[图片]" 文本占位符；若不支持 tool_use，清空工具集。
+    # 6b. _plugin_tool_fix：若会话绑定了特定插件，移除不属于这些插件的工具
+    #     （MCP 工具和无插件归属的工具会被保留）。
+    # 6c. _sanitize_context_by_modalities：遍历对话历史，剥离 Provider 不支持
+    #     的图片块/工具消息，避免历史上下文中的不兼容内容导致 API 报错。
     _modalities_fix(provider, req)
     _plugin_tool_fix(event, req)
     _sanitize_context_by_modalities(config, provider, req)
 
+    # ── 阶段 7：安全模式注入 ─────────────────────────────────────────────
+    # 将安全模式系统提示词**前置拼接**到现有 system_prompt 之前，
+    # 确保安全指令始终占据最高优先级位置。
+    # 拼接结果：system_prompt = 安全提示词 + "\n\n" + (人格 + 技能 + 知识库 + ...)
     if config.llm_safety_mode:
         _apply_llm_safety_mode(config, req)
 
+    # ── 阶段 8：计算机使用工具（沙箱 / 本地）────────────────────────────
+    # 根据配置的运行时环境注册执行工具：
+    #   - "sandbox"：shell、python、文件上传/下载、浏览器、Neo 技能生命周期
+    #     等工具 + 将 SANDBOX_MODE_PROMPT 追加到 system_prompt。
+    #   - "local"：仅注册本地 shell + python 执行工具。
     if config.computer_use_runtime == "sandbox":
         _apply_sandbox_tools(config, req, req.session_id)
     elif config.computer_use_runtime == "local":
@@ -1260,14 +1340,21 @@ async def build_main_agent(
         event=event,
     )
 
+    # ── 阶段 9：附加能力工具 ─────────────────────────────────────────────
+    # 注册定时任务管理工具（创建/删除/列出计划任务）。
     if config.add_cron_tools:
         _proactive_cron_job_tools(req)
 
+    # 若平台支持主动消息推送，注册主动发消息工具，
+    # 允许 LLM 在未被提问的情况下主动向用户发送消息。
     if event.platform_meta.support_proactive_message:
         if req.func_tool is None:
             req.func_tool = ToolSet()
         req.func_tool.add_tool(SEND_MESSAGE_TO_USER_TOOL)
 
+    # ── 阶段 10：Token 上限自动检测 ──────────────────────────────────────
+    # 若 Provider 未显式配置 max_context_tokens，则尝试从内置的
+    # LLM_METADATAS 表中查找该模型的上下文窗口大小。
     if provider.provider_config.get("max_context_tokens", 0) <= 0:
         model = provider.get_model()
         if model_info := LLM_METADATAS.get(model):
@@ -1275,9 +1362,15 @@ async def build_main_agent(
                 "context"
             ]
 
+    # WebChat 平台：异步后台任务，自动为会话生成标题。
     if event.get_platform_name() == "webchat":
         asyncio.create_task(_handle_webchat(event, req, provider))
 
+    # ── 阶段 11：System Prompt 最终化 ────────────────────────────────────
+    # 仅当存在工具时，才向 system_prompt 追加工具调用指令。
+    # 根据 tool_schema_mode 有两种变体：
+    #   - "full"：每个工具包含完整的 JSON Schema 参数描述
+    #   - "skills_like"：仅包含工具名称 + 描述（无参数细节）
     if req.func_tool and req.func_tool.tools:
         tool_prompt = (
             TOOL_CALL_PROMPT
@@ -1286,10 +1379,22 @@ async def build_main_agent(
         )
         req.system_prompt += f"\n{tool_prompt}\n"
 
+    # 若当前是直播（实时语音/视频）会话，追加直播模式指令。
     action_type = event.get_extra("action_type")
     if action_type == "live":
         req.system_prompt += f"\n{LIVE_MODE_SYSTEM_PROMPT}\n"
 
+    # ── 阶段 12：AgentRunner reset ───────────────────────────────────────
+    # 使用完整组装好的 ProviderRequest 初始化 AgentRunner。
+    # reset() 执行最终的 messages[] 数组组装，即发给 LLM 的完整消息列表：
+    #   1) contexts（对话历史，begin_dialogs 已插入头部）
+    #   2) 当前用户消息 = assemble_context(prompt, extra_user_content_parts, image_urls)
+    #   3) system 消息插入到 index 0，携带完整的 system_prompt
+    # 同时配置上下文管理策略：
+    #   - truncate_turns：FIFO 出队，保持上下文在轮数限制内
+    #   - enforce_max_turns：对话轮数硬上限
+    #   - llm_compress：当接近 Token 上限时，用 LLM 对旧上下文进行摘要压缩
+    #   - fallback_providers：主 Provider 失败时的备用 LLM 列表
     reset_coro = agent_runner.reset(
         provider=provider,
         request=req,

@@ -254,10 +254,16 @@ class CronJobManager:
             "cron_payload": payload,
         }
 
+        # Extract extended payload fields for long-running tasks
+        max_step = int(payload.get("max_step", 30))
+        workspace = payload.get("workspace")
+
         await self._woke_main_agent(
             message=note,
             session_str=session_str,
             extras=extras,
+            max_step=max_step,
+            workspace=workspace,
         )
 
     async def _woke_main_agent(
@@ -266,8 +272,20 @@ class CronJobManager:
         message: str,
         session_str: str,
         extras: dict,
+        max_step: int = 30,
+        workspace: str | None = None,
     ) -> None:
-        """Woke the main agent to handle the cron job message."""
+        """Woke the main agent to handle the cron job message.
+
+        Args:
+            message: The task description or note for the agent.
+            session_str: The unified message origin session string.
+            extras: Extra metadata including cron_job info and cron_payload.
+            max_step: Maximum number of agent steps (LLM calls). Default 30.
+                For complex long-running tasks, set this higher (e.g. 50-80).
+            workspace: Optional workspace directory path. When set, the agent
+                will be instructed to operate within this directory.
+        """
         from astrbot.core.astr_main_agent import (
             MainAgentBuildConfig,
             _get_session_conv,
@@ -318,7 +336,7 @@ class CronJobManager:
         req = ProviderRequest()
         conv = await _get_session_conv(event=cron_event, plugin_context=self.ctx)
         req.conversation = conv
-        # finetine the messages
+        # finetune the messages
         context = json.loads(conv.history)
         if context:
             req.contexts = context
@@ -334,6 +352,28 @@ class CronJobManager:
         req.system_prompt += PROACTIVE_AGENT_CRON_WOKE_SYSTEM_PROMPT.format(
             cron_job=cron_job_str
         )
+
+        # Inject workspace context into system prompt
+        if workspace:
+            req.system_prompt += (
+                "\n# WORKSPACE CONTEXT\n"
+                f"Your designated workspace directory is: {workspace}\n"
+                "All file operations (create, read, write) and shell commands "
+                "MUST be executed within this directory. "
+                "Use `cd {workspace}` before running shell commands. "
+                "Do NOT modify files outside this workspace.\n"
+            )
+
+        # Inject execution state from payload for cross-run tracking
+        execution_state = cron_payload.get("execution_state")
+        if execution_state:
+            req.system_prompt += (
+                "\n# EXECUTION STATE (from previous runs)\n"
+                f"{json.dumps(execution_state, ensure_ascii=False)}\n"
+                "Use this state to continue from where you left off. "
+                "Update the execution state at the end of your task.\n"
+            )
+
         req.prompt = (
             "You are now responding to a scheduled task. "
             "Proceed according to your system instructions. "
@@ -352,7 +392,7 @@ class CronJobManager:
             return
 
         runner = result.agent_runner
-        async for _ in runner.step_until_done(30):
+        async for _ in runner.step_until_done(max_step):
             # agent will send message to user via using tools
             pass
         llm_resp = runner.get_final_llm_resp()
@@ -371,6 +411,7 @@ class CronJobManager:
             event=cron_event,
             req=req,
             summary_note=summary_note,
+            cron_meta=cron_meta,
         )
         if not llm_resp:
             logger.warning("Cron job agent got no response")

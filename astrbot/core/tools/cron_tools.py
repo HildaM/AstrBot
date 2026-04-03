@@ -48,6 +48,14 @@ class CreateActiveCronTool(FunctionTool[AstrAgentContext]):
                     "type": "boolean",
                     "description": "If true, the task will run only once and then be deleted. Use run_at to specify the time.",
                 },
+                "max_step": {
+                    "type": "integer",
+                    "description": "Maximum number of agent steps (LLM calls) for this task. Default 30. Set higher (e.g. 50-80) for complex multi-step tasks like content creation pipelines.",
+                },
+                "workspace": {
+                    "type": "string",
+                    "description": "Optional workspace directory path. The agent will be restricted to operate within this directory for all file and shell operations.",
+                },
             },
             "required": ["note"],
         }
@@ -65,6 +73,8 @@ class CreateActiveCronTool(FunctionTool[AstrAgentContext]):
         run_once = bool(kwargs.get("run_once", False))
         note = str(kwargs.get("note", "")).strip()
         name = str(kwargs.get("name") or "").strip() or "active_agent_task"
+        max_step = kwargs.get("max_step")
+        workspace = kwargs.get("workspace")
 
         if not note:
             return "error: note is required."
@@ -81,12 +91,18 @@ class CreateActiveCronTool(FunctionTool[AstrAgentContext]):
             except Exception:
                 return "error: run_at must be ISO datetime, e.g., 2026-02-02T08:00:00+08:00"
 
-        payload = {
+        payload: dict[str, Any] = {
             "session": context.context.event.unified_msg_origin,
             "sender_id": context.context.event.get_sender_id(),
             "note": note,
             "origin": "tool",
         }
+
+        # Extended payload fields for long-running/workspace tasks
+        if max_step is not None:
+            payload["max_step"] = int(max_step)
+        if workspace:
+            payload["workspace"] = str(workspace).strip()
 
         job = await cron_mgr.add_active_job(
             name=name,
